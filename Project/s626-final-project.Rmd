@@ -1,0 +1,686 @@
+---
+title: "s626-final-project"
+author: "Saumya Mehta"
+date: "2022-11-07"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(parallel)
+library(MASS)
+library(lubridate)
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+knitr::opts_chunk$set(echo = TRUE, 
+                      comment = NA, 
+                      warning = FALSE, 
+                      message = FALSE, 
+                      fig.pos = 'H', 
+                      fig.align = 'center')
+options(xtable.comment = FALSE, 
+        xtable.table.placement = 'H')
+set.seed(300)
+```
+
+## load data
+
+```{r}
+weather <- read.csv("data/weatherHistory.csv", header=TRUE)
+```
+
+
+## select relevant data:
+
+```{r}
+weather.df1 <- weather %>% 
+  mutate(Precip.Type = recode(Precip.Type,"null" = 2, "snow" = 3, "rain" = 4),
+         Precip.Type = log(Precip.Type)) %>% 
+  dplyr::select("apparent_temperature" = Apparent.Temperature..C.,
+                "temperature" = Temperature..C.,
+                "precip_type" = Precip.Type,
+                "humidity" = Humidity,
+                "wind_speed" = Wind.Speed..km.h.,
+                "visibility" = Visibility..km.,
+                "wind_degrees" = Wind.Bearing..degrees.,
+                "pressure" = Pressure..millibars.)  
+rand_ind <- sample(nrow(weather.df1),300, replace = FALSE) 
+
+weather.df <-  weather.df1[rand_ind,]
+```
+
+
+
+We will try creating a model with apparent temperature as the response variable and temperature, humidity, visibility and wind speed and wind_degrees as our explanatory variables
+
+```{r}
+weather.df  <- weather.df %>% 
+  dplyr::select(apparent_temperature,temperature,humidity,visibility, wind_speed, wind_degrees)  
+ 
+```
+
+## Bayesian Linear regression using Zellner-g prior:
+
+```{r}
+y <- as.matrix(weather.df[,1])
+X <- model.matrix(apparent_temperature ~ ., weather.df)
+n <- length(y)
+g<- NROW(weather.df)
+nu0 <- 1
+sigma20 <- summary(lm(y ~ X[,-1], data = weather.df))$sigma^2
+nSamples <- 1e4
+trace <- list(s2 = numeric(nSamples), beta = array(NA, dim=c(nSamples,6)))
+```
+
+## constants
+```{r}
+
+#X <- model.matrix(apparent_temperature ~ ., data = weather.df)
+XtX.inv <- solve(t(X) %*% X)
+H <- X %*% XtX.inv %*%t(X)
+beta.ols <- XtX.inv %*%t(X)%*%y
+SSRg <- t(y) %*% (diag(n) - g/(g+1) *H) %*% y
+
+# collect sigma^2 and beta
+for (i in 1:nSamples){
+  s2 <- 1/rgamma(n=1, shape = (nu0+n)/2, rate = (nu0*sigma20 + SSRg)/2)
+  beta <- mvrnorm(n=1, mu = g/(g+1)*beta.ols, Sigma=g/(g+1) * s2 * XtX.inv)
+  trace$s2[i] <- s2
+  trace$beta[i,] <- beta
+}
+signif.df <- plyr::aaply(trace$beta, 2, function(b) {
+  quantile(b, c(.025, .975))
+}) %>% 
+  as.data.frame() %>% 
+  dplyr::mutate(covariate = factor(c('intercept', colnames(weather.df[-1])), 
+                                   levels = c('intercept',
+                                              colnames(weather.df[-1]))))
+ggplot(signif.df) + 
+  geom_errorbar(aes(x = covariate, ymin = `2.5%`, ymax = `97.5%`)) + 
+  geom_abline(slope = 0, colour = 'red') + 
+  labs(title = '95% CI of coefficients')
+```
+According to our analysis, only temperature, humidity and wind speed are strongly predictive variables. 
+
+
+```{r}
+apply(trace$beta, MARGIN = 2, FUN = mean)
+pairs(trace$beta)
+```
+
+```{r}
+# log marginal code referenced from course material on bayesian linear regression
+log.marginal.y <- function(y, x, g = length(y), nu0){
+  n <- length(y)
+  p <- ncol(x)
+  if (p == 0) {
+    sigma20 <- mean(y^2)
+    SSRg <- t(y) %*% y
+  } else{
+    tmp_lm <- lm(y~x + 0)
+    sigma20 <- summary(tmp_lm)$sigma^2
+    SSRg <- t(y) %*% y - g/(g+1) * t(y) %*% predict(tmp_lm)
+  }
+  res <- -0.5723649429247 * n + #the magic number is log(pi)/2
+    lgamma(0.5*(nu0 + n)) -lgamma(0.5*nu0) +
+     0.5 * ( -p * log( 1 + g ) +
+              nu0 * log( nu0 * sigma20) +
+              -(nu0 + n) * log(nu0 * sigma20 + SSRg)
+     )
+  return(res)
+}
+
+z <- as.matrix(expand.grid(0:1, 0:1, 0:1, 0:1,0:1,0:1))
+dimnames(z) <- list(NULL, c('Intercept', 'temperature','humidity','visibility','wind_speed','wind_degrees'))
+cols <- apply(z, MARGIN = 1, FUN = function(x)which(x == 1))
+
+lp <- numeric()
+for (i in 1:64){
+  xz <- as.matrix(X[, cols[[i]] ], nrow = length(y))
+  lp[i] <- log.marginal.y(y=y, x=xz, nu0 = 1)
+  
+}
+probs <- exp(lp) /sum(exp(lp))
+cbind(z,lp, probs) %>% View()
+#Posterior mode of the model posterior:
+z[which(probs == max(probs)), ]
+```
+
+We can confirm Temperature, Humidity and Windspeed are the only significant variables as we get the highest posterior density when selecting a model with only these variables
+
+
+```{r}
+X <- model.matrix(apparent_temperature ~ ., weather.df %>% dplyr::select(apparent_temperature,temperature,humidity,wind_speed))
+n <- nrow(X)
+
+XtX.inv <- solve(t(X) %*% X)
+H <- X %*% XtX.inv %*% t(X)
+y <- weather.df$apparent_temperature
+tmp_lm <-lm(y  ~ X + 0)
+s20 <- summary(tmp_lm)$sigma^2
+beta.ols <- XtX.inv %*% t(X) %*% weather.df$apparent_temperature
+ssreg <- t(weather.df$apparent_temperature) %*% (diag(n) - g / (g + 1) * H ) %*% weather.df$apparent_temperature
+trace <- list(s2 = numeric(nSamples), beta = array(NA, dim=c(nSamples,4)))
+
+# collect sigma^2 and beta
+for (i in 1:nSamples){
+  s2 <- 1/rgamma(n=1, shape = (nu0+n)/2, rate = (nu0*sigma20 + SSRg)/2)
+  beta <- mvrnorm(n=1, mu = g/(g+1)*beta.ols, Sigma=g/(g+1) * s2 * XtX.inv)
+  trace$s2[i] <- s2
+  trace$beta[i,] <- beta
+}
+```
+
+
+```{r}
+# create a test matrix:
+test.df.sample <- weather.df1[-rand_ind, ] %>% dplyr::select(apparent_temperature,temperature, humidity,wind_speed)
+rand_ind1 <- sample(nrow(test.df.sample), 300, replace = FALSE) 
+test.df.sample <- test.df.sample[rand_ind1,]
+test.model.matrix <- model.matrix(apparent_temperature ~ ., test.df.sample)
+```
+
+
+```{r}
+# fit to test data
+beta.means <- apply(trace$beta, 2, mean)
+yhat.test <- test.model.matrix %*% beta.means
+# prediction error on test data
+mean((test.df.sample$apparent_temperature - yhat.test) ** 2)
+ggplot() + 
+  geom_point(aes(x = test.df.sample$apparent_temperature, y = yhat.test)) + 
+  geom_abline(colour = 'red') + 
+  labs(x = 'observed', y = 'predicted')
+```
+
+## Trace plots for beta
+```{r}
+plot(trace$beta[,1], type = 'l')
+plot(trace$beta[,2], type = 'l')
+plot(trace$beta[,3], type = 'l')
+
+plot(trace$beta[,4], type = 'l')
+
+```
+
+## Auto correlation plots and effective sample size
+```{r}
+acf(trace$beta[,1])
+acf(trace$beta[,2])
+acf(trace$beta[,3])
+acf(trace$beta[,4])
+```
+
+```{r}
+library(coda)
+effectiveSize(trace$beta)
+```
+
+From the trace plots, auto-correlation plots, we can say that the samples we get are independent
+
+# Interactions between explanatory variables
+
+We will try to model interations between explanatory variables and select the best performing model.
+
+```{r}
+X <- model.matrix( apparent_temperature~ (temperature+ humidity+ wind_speed)^2+ temperature:humidity:wind_speed, data=weather.df)
+y <- weather.df$apparent_temperature
+n <- length(y)
+p <- ncol(X)
+g<- NROW(weather.df)
+nu0 <- 1
+sigma20 <- summary(lm(y ~ X[,-1], data = weather.df))$sigma^2
+nSamples <- 1e4
+trace <- list(s2 = numeric(nSamples), beta = array(NA, dim=c(nSamples,p)))
+```
+
+```{r}
+n <- nrow(X)
+
+XtX.inv <- solve(t(X) %*% X)
+H <- X %*% XtX.inv %*%t(X)
+beta.ols <- XtX.inv %*%t(X)%*%weather.df$apparent_temperature
+SSRg <- t(weather.df$apparent_temperature) %*% (diag(n) - g/(g+1) *H) %*% weather.df$apparent_temperature
+
+# collect sigma^2 and beta
+for (i in 1:nSamples){
+  s2 <- 1/rgamma(n=1, shape = (nu0+n)/2, rate = (nu0*sigma20 + SSRg)/2)
+  beta <- mvrnorm(n=1, mu = g/(g+1)*beta.ols, Sigma=g/(g+1) * s2 * XtX.inv)
+  trace$s2[i] <- s2
+  trace$beta[i,] <- beta
+}
+signif.df <- plyr::aaply(trace$beta, 2, function(b) {
+  quantile(b, c(.025, .975))
+}) %>% 
+  as.data.frame() %>% 
+  dplyr::mutate(covariate = factor(c('intercept', colnames(X)[-1]), 
+                                   levels = c('intercept',
+                                              colnames(X)[-1])))
+ggplot(signif.df) + 
+  geom_errorbar(aes(x = covariate, ymin = `2.5%`, ymax = `97.5%`)) + 
+  geom_abline(slope = 0, colour = 'red') + 
+  labs(title = '95% CI of coefficients')
+```
+As we can see, after adding interactions, humidity and wind_speed become less significant and we observe that the interaction between temperature and wind_speed, humidity and wind_speed and between temperature, humidity and wind_speed may be significant for prediction. We confirm this via model selection:
+```{r}
+# log marginal code referenced from course material on bayesian linear regression
+log.marginal.y <- function(y, x, g = length(y), nu0){
+  n <- length(y)
+  p <- ncol(x)
+  if (p == 0) {
+    sigma20 <- mean(y^2)
+    SSRg <- t(y) %*% y
+  } else{
+    tmp_lm <- lm(y~x + 0)
+    sigma20 <- summary(tmp_lm)$sigma^2
+    SSRg <- t(y) %*% y - g/(g+1) * t(y) %*% predict(tmp_lm)
+  }
+  res <- -0.5723649429247 * n + #the magic number is log(pi)/2
+    lgamma(0.5*(nu0 + n)) -lgamma(0.5*nu0) +
+     0.5 * ( -p * log( 1 + g ) +
+              nu0 * log( nu0 * sigma20) +
+              -(nu0 + n) * log(nu0 * sigma20 + SSRg)
+     )
+  return(res)
+}
+
+z <- as.matrix(expand.grid(0:1, 0:1, 0:1, 0:1,0:1,0:1,0:1,0:1))
+dimnames(z) <- list(NULL, c('Intercept', 'temperature','humidity','wind_speed','temperature x humidity', 'temperature x wind_speed', 'humidity x windspeed', 'temperature x humidity x windspeed'))
+cols <- apply(z, MARGIN = 1, FUN = function(x)which(x == 1))
+
+lp <- numeric()
+for (i in 1:256){
+  xz <- as.matrix(X[, cols[[i]] ], nrow = length(y))
+  lp[i] <- log.marginal.y(y=y, x=xz, nu0 = 1)
+  
+}
+probs <- exp(lp) /sum(exp(lp))
+cbind(z,lp, probs)
+#Posterior mode of the model posterior:
+z[which(probs == max(probs)), ]
+```
+
+As we can see, the best performing model includes an interaction between temperature and wind_speed, humidity and wind_speed and between temperature, humidity and wind_speed
+
+### Running bayesian analysis again with variables for the best model
+```{r}
+X <- X [, c(2, 6,7,8)]
+n <- nrow(X)
+p <- ncol(X)
+XtX.inv <- solve(t(X) %*% X)
+H <- X %*% XtX.inv %*% t(X)
+tmp_lm <-lm(y  ~ X + 0)
+s20 <- summary(tmp_lm)$sigma^2
+beta.ols <- XtX.inv %*% t(X) %*%y
+ssreg <- t(y) %*% (diag(n) - g / (g + 1) * H ) %*% y
+trace <- list(s2 = numeric(nSamples), beta = array(NA, dim=c(nSamples,p)))
+
+# collect sigma^2 and beta
+for (i in 1:nSamples){
+  s2 <- 1/rgamma(n=1, shape = (nu0+n)/2, rate = (nu0*sigma20 + SSRg)/2)
+  beta <- mvrnorm(n=1, mu = g/(g+1)*beta.ols, Sigma=g/(g+1) * s2 * XtX.inv)
+  trace$s2[i] <- s2
+  trace$beta[i,] <- beta
+}
+```
+
+
+
+```{r}
+# create a test matrix:
+test.df.sample <- weather.df1[-rand_ind, ] %>% dplyr::select(apparent_temperature,temperature, humidity,wind_speed)
+rand_ind1 <- sample(nrow(test.df.sample), 300, replace = FALSE) 
+test.df.sample <- test.df.sample[rand_ind1,]
+test.model.matrix <- model.matrix(apparent_temperature ~ (temperature+ humidity+ wind_speed)^2+ temperature:humidity:wind_speed, test.df.sample)[, c(2,6,7,8)]
+
+```
+
+```{r}
+# fit to test data
+beta.means <- apply(trace$beta, 2, mean)
+yhat.test <- test.model.matrix %*% beta.means
+# prediction error on test data
+mean((test.df.sample$apparent_temperature - yhat.test) ** 2)
+ggplot() + 
+  geom_point(aes(x = test.df.sample$apparent_temperature, y = yhat.test)) + 
+  geom_abline(colour = 'red') + 
+  labs(x = 'observed', y = 'predicted')
+```
+
+As we can see, the model with interaction has a lower prediction error compared to model without interactions
+
+## Trace plots for beta
+```{r}
+plot(trace$beta[,1], type = 'l')
+plot(trace$beta[,2], type = 'l')
+plot(trace$beta[,3], type = 'l')
+
+plot(trace$beta[,4], type = 'l')
+
+```
+
+## Auto correlation plots and effective sample size
+```{r}
+acf(trace$beta[,1])
+acf(trace$beta[,2])
+acf(trace$beta[,3])
+acf(trace$beta[,4])
+```
+
+```{r}
+library(coda)
+effectiveSize(trace$beta)
+```
+
+From the trace plots, auto-correlation plots, we can say that the samples we get are independent
+
+
+# Default Priors:
+
+```{r}
+sample_data = sample_n(weather.df1, 500) %>% dplyr::select(apparent_temperature,temperature,humidity,visibility, wind_speed, wind_degrees)
+
+#splitting training and validation set from the sampled data
+sample <- sample(c(TRUE, FALSE), nrow(sample_data), replace=TRUE, prob=c(0.7,0.3))
+weather.df = sample_data[sample,]
+test.df = sample_data[!sample,]
+dim(weather.df)
+dim(test.df)
+#Bayesian linear regression using default priors
+
+X = model.matrix(apparent_temperature ~ ., weather.df)
+y = weather.df$apparent_temperature
+n = nrow(weather.df)
+
+#setting prior values using OLS
+a = solve(t(X) %*% X)
+b = t(X) %*% y
+beta_0 = a %*% b
+SSR_beta_0 = t(y - X%*%beta_0) %*% (y - X%*%beta_0)
+sigma_20 = SSR_beta_0/(n - p)
+nu_0 = 1
+cov_0 = (t(X) %*% X)/as.vector(n*sigma_20)
+
+trace <- list(s2 = numeric(nSamples), beta = array(NA, dim=c(nSamples,6)))
+
+for (i in 1:nSamples){
+  s2 <- 1/rgamma(n=1, shape = (nu_0+n)/2, rate = (nu_0*sigma_20 + SSR_beta_0)/2)
+  beta <- mvrnorm(n=1, mu = beta_0, Sigma = s2 * a)
+  trace$s2[i] <- s2
+  trace$beta[i,] <- beta
+}
+
+signif.df <- plyr::aaply(trace$beta, 2, function(b) {
+  quantile(b, c(.025, .975))
+}) %>% 
+  as.data.frame() %>% 
+  dplyr::mutate(covariate = factor(c('intercept', colnames(weather.df[-1])), 
+                                   levels = c('intercept',
+                                              colnames(weather.df[-1]))))
+ggplot(signif.df) + 
+  geom_errorbar(aes(x = covariate, ymin = `2.5%`, ymax = `97.5%`)) + 
+  geom_abline(slope = 0, colour = 'red') + 
+  labs(title = '95% CI of coefficients')
+```
+
+```{r}
+y <- as.matrix(weather.df[,1])
+x <- model.matrix(apparent_temperature ~ ., weather.df)
+log.marginal.y <- function(y, x, g = length(y), nu0){
+  n <- length(y)
+  p <- ncol(x)
+  if (p == 0) {
+    sigma20 <- mean(y^2)
+    SSRg <- t(y) %*% y
+  } else{
+    tmp_lm <- lm(y~x + 0)
+    sigma20 <- summary(tmp_lm)$sigma^2
+    SSRg <- t(y) %*% y - g/(g+1) * t(y) %*% predict(tmp_lm)
+  }
+  res <- -0.5723649429247 * n + #the magic number is log(pi)/2
+    lgamma(0.5*(nu0 + n)) -lgamma(0.5*nu0) +
+    0.5 * ( -p * log( 1 + g ) +
+              nu0 * log( nu0 * sigma20) +
+              -(nu0 + n) * log(nu0 * sigma20 + SSRg)
+    )
+  return(res)
+}
+
+z <- as.matrix(expand.grid(0:1, 0:1, 0:1, 0:1,0:1,0:1))
+dimnames(z) <- list(NULL, c('Intercept', 'temperature','humidity','visibility','wind_speed','wind_degrees'))
+cols <- apply(z, MARGIN = 1, FUN = function(x)which(x == 1))
+
+lp <- numeric()
+for (i in 1:64){
+  xz <- as.matrix(x[, cols[[i]] ], nrow = length(y))
+  lp[i] <- log.marginal.y(y=y, x=xz, nu0 = 1)
+  
+}
+probs <- exp(lp) /sum(exp(lp))
+cbind(z,lp, probs)
+
+# posterior mode
+z[which(probs == max(probs)), ]
+```
+
+```{r}
+sample_data = sample_n(weather.df1, 500) %>% dplyr::select(apparent_temperature, temperature, wind_speed, humidity)
+
+#splitting training and validation set from the sampled data
+sample <- sample(c(TRUE, FALSE), nrow(sample_data), replace=TRUE, prob=c(0.7,0.3))
+weather.df = sample_data[sample,]
+test.df = sample_data[!sample,]
+
+X <- model.matrix(apparent_temperature ~ ., weather.df)
+n <- nrow(X)
+y <- weather.df$apparent_temperature
+a = solve(t(X) %*% X)
+b = t(X) %*% y
+beta_0 = a %*% b
+SSR_beta_0 = t(y - X%*%beta_0) %*% (y - X%*%beta_0)
+sigma_20 = SSR_beta_0/(n - p)
+nu_0 = 1
+cov_0 = (t(X) %*% X)/as.vector(n*sigma_20)
+
+trace <- list(s2 = numeric(nSamples), beta = array(NA, dim=c(nSamples,4)))
+
+for (i in 1:nSamples){
+  s2 <- 1/rgamma(n=1, shape = (nu_0+n)/2, rate = (nu_0*sigma_20 + SSR_beta_0)/2)
+  beta <- mvrnorm(n=1, mu = beta_0, Sigma = s2 * a)
+  trace$s2[i] <- s2
+  trace$beta[i,] <- beta
+}
+
+#testing our values on the validation data
+test.df.matrix = model.matrix(apparent_temperature ~ ., test.df)
+y_actual.test = test.df$apparent_temperature
+beta.means = apply(trace$beta, FUN = mean, MARGIN = 2)
+y_hat.test = test.df.matrix %*% beta.means
+sq_error_default = mean((as.vector(y_actual.test) - as.vector(y_hat.test)) ** 2)
+
+#plotting the predicted and actual values
+ggplot() + 
+  geom_point(aes(x = test.df$apparent_temperature, y = y_hat.test)) + 
+  geom_abline(colour = 'red') + 
+  labs(x = 'observed', y = 'predicted')
+
+print(sq_error_default)
+```
+## Trace plots for beta
+```{r}
+plot(trace$beta[,1], type = 'l')
+plot(trace$beta[,2], type = 'l')
+plot(trace$beta[,3], type = 'l')
+
+plot(trace$beta[,4], type = 'l')
+
+```
+
+## Auto correlation plots and effective sample size
+```{r}
+acf(trace$beta[,1])
+acf(trace$beta[,2])
+acf(trace$beta[,3])
+acf(trace$beta[,4])
+```
+
+```{r}
+library(coda)
+effectiveSize(trace$beta)
+```
+
+```{r}
+sample_data = sample_n(weather.df1, 500) %>% dplyr::select(apparent_temperature,temperature,humidity,visibility, wind_speed, wind_degrees)
+
+#splitting training and validation set from the sampled data
+sample <- sample(c(TRUE, FALSE), nrow(sample_data), replace=TRUE, prob=c(0.7,0.3))
+weather.df = sample_data[sample,]
+test.df = sample_data[!sample,]
+dim(weather.df)
+dim(test.df)
+#Bayesian linear regression using default priors
+
+X = model.matrix( apparent_temperature~ (temperature+ humidity+ wind_speed)^2+ temperature:humidity:wind_speed, data=weather.df)
+y = weather.df$apparent_temperature
+n = nrow(weather.df)
+p <- ncol(X)
+#setting prior values using OLS
+a = solve(t(X) %*% X)
+b = t(X) %*% y
+beta_0 = a %*% b
+SSR_beta_0 = t(y - X%*%beta_0) %*% (y - X%*%beta_0)
+sigma_20 = SSR_beta_0/(n - p)
+nu_0 = 1
+cov_0 = (t(X) %*% X)/as.vector(n*sigma_20)
+
+trace <- list(s2 = numeric(nSamples), beta = array(NA, dim=c(nSamples,p)))
+
+for (i in 1:nSamples){
+  s2 <- 1/rgamma(n=1, shape = (nu_0+n)/2, rate = (nu_0*sigma_20 + SSR_beta_0)/2)
+  beta <- mvrnorm(n=1, mu = beta_0, Sigma = s2 * a)
+  trace$s2[i] <- s2
+  trace$beta[i,] <- beta
+}
+
+signif.df <- plyr::aaply(trace$beta, 2, function(b) {
+  quantile(b, c(.025, .975))
+}) %>% 
+  as.data.frame() %>% 
+  dplyr::mutate(covariate = factor(c('intercept', colnames(X)[-1]), 
+                                   levels = c('intercept',
+                                              colnames(X)[-1])))
+ggplot(signif.df) + 
+  geom_errorbar(aes(x = covariate, ymin = `2.5%`, ymax = `97.5%`)) + 
+  geom_abline(slope = 0, colour = 'red') + 
+  labs(title = '95% CI of coefficients')
+```
+
+```{r}
+y <- as.matrix(weather.df[,1])
+x <- model.matrix( apparent_temperature~ (temperature+ humidity+ wind_speed)^2+ temperature:humidity:wind_speed, weather.df)
+log.marginal.y <- function(y, x, g = length(y), nu0){
+  n <- length(y)
+  p <- ncol(x)
+  if (p == 0) {
+    sigma20 <- mean(y^2)
+    SSRg <- t(y) %*% y
+  } else{
+    tmp_lm <- lm(y~x + 0)
+    sigma20 <- summary(tmp_lm)$sigma^2
+    SSRg <- t(y) %*% y - g/(g+1) * t(y) %*% predict(tmp_lm)
+  }
+  res <- -0.5723649429247 * n + #the magic number is log(pi)/2
+    lgamma(0.5*(nu0 + n)) -lgamma(0.5*nu0) +
+    0.5 * ( -p * log( 1 + g ) +
+              nu0 * log( nu0 * sigma20) +
+              -(nu0 + n) * log(nu0 * sigma20 + SSRg)
+    )
+  return(res)
+}
+
+z <- as.matrix(expand.grid(0:1, 0:1, 0:1, 0:1,0:1,0:1,0:1,0:1))
+dimnames(z) <- list(NULL, c('Intercept', 'temperature','humidity','wind_speed','temperature x humidity', 'temperature x wind_speed', 'humidity x windspeed', 'temperature x humidity x windspeed'))
+cols <- apply(z, MARGIN = 1, FUN = function(x)which(x == 1))
+
+lp <- numeric()
+for (i in 1:256){
+  xz <- as.matrix(x[, cols[[i]] ], nrow = length(y))
+  lp[i] <- log.marginal.y(y=y, x=xz, nu0 = 1)
+  
+}
+probs <- exp(lp) /sum(exp(lp))
+cbind(z,lp, probs)
+
+# posterior mode
+z[which(probs == max(probs)), ]
+```
+
+```{r}
+sample_data = sample_n(weather.df1, 500) %>% dplyr::select(apparent_temperature, temperature, wind_speed, humidity)
+
+#splitting training and validation set from the sampled data
+sample <- sample(c(TRUE, FALSE), nrow(sample_data), replace=TRUE, prob=c(0.7,0.3))
+weather.df = sample_data[sample,]
+test.df = sample_data[!sample,]
+
+X <- model.matrix(apparent_temperature~ (temperature+ humidity+ wind_speed)^2+ temperature:humidity:wind_speed, weather.df) [,c(2,6,7,8)]
+n <- nrow(X)
+y <- weather.df$apparent_temperature
+a = solve(t(X) %*% X)
+b = t(X) %*% y
+beta_0 = a %*% b
+SSR_beta_0 = t(y - X%*%beta_0) %*% (y - X%*%beta_0)
+sigma_20 = SSR_beta_0/(n - p)
+nu_0 = 1
+cov_0 = (t(X) %*% X)/as.vector(n*sigma_20)
+
+trace <- list(s2 = numeric(nSamples), beta = array(NA, dim=c(nSamples,4)))
+
+for (i in 1:nSamples){
+  s2 <- 1/rgamma(n=1, shape = (nu_0+n)/2, rate = (nu_0*sigma_20 + SSR_beta_0)/2)
+  beta <- mvrnorm(n=1, mu = beta_0, Sigma = s2 * a)
+  trace$s2[i] <- s2
+  trace$beta[i,] <- beta
+}
+
+#testing our values on the validation data
+test.df.matrix = model.matrix(apparent_temperature~ (temperature+ humidity+ wind_speed)^2+ temperature:humidity:wind_speed, test.df)[,c(2,6,7,8)]
+y_actual.test = test.df$apparent_temperature
+beta.means = apply(trace$beta, FUN = mean, MARGIN = 2)
+y_hat.test = test.df.matrix %*% beta.means
+sq_error_default = mean((as.vector(y_actual.test) - as.vector(y_hat.test)) ** 2)
+
+#plotting the predicted and actual values
+ggplot() + 
+  geom_point(aes(x = test.df$apparent_temperature, y = y_hat.test)) + 
+  geom_abline(colour = 'red') + 
+  labs(x = 'observed', y = 'predicted')
+
+print(sq_error_default)
+```
+## Trace plots for beta
+```{r}
+plot(trace$beta[,1], type = 'l')
+plot(trace$beta[,2], type = 'l')
+plot(trace$beta[,3], type = 'l')
+
+plot(trace$beta[,4], type = 'l')
+
+```
+
+## Auto correlation plots and effective sample size
+```{r}
+acf(trace$beta[,1])
+acf(trace$beta[,2])
+acf(trace$beta[,3])
+acf(trace$beta[,4])
+```
+
+```{r}
+library(coda)
+effectiveSize(trace$beta)
+```
